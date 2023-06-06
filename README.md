@@ -11,6 +11,7 @@ To use this you must :-
 
 Your ycash.conf file should look like this :- 
 
+```
 mainnet=1
 server=1
 listen=1
@@ -21,6 +22,7 @@ rpcpassword=not_telling_you_this either!
 zmqpubhashblock=ipc:///tmp/ycash.block.raw
 minetolocalwallet=1
 mineraddress=ys1_change_to_your_shielded_ycash_address
+```
 
 NOTE: ycash-stratum has to run as root, its a server that opens network sockets
 
