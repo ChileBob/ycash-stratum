@@ -12,8 +12,6 @@ use JSON;
 
 use Digest::SHA qw(sha256);
 
-use Switch;
-
 use IO::Socket;
 
 use IO::Socket::INET;
