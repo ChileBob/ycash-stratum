@@ -1,0 +1,420 @@
+#!/usr/bin/perl -w8
+#
+# ChileBobs Stratum Connector : Designed for Ycash (Improved Version)
+#
+use 5.010;
+use strict;
+
+my $version = 'ChileBobs Mining Pool Server (v2)';  # version number
+
+my $select_timeout = 0.1;  # seconds to check sockets for activity
+
+my $debug = int(!!$ENV{DEBUG}) || 0;  # 1 = show debug messages
+
+use ZMQ::FFI qw(ZMQ_SUB);
+
+use Time::HiRes q(usleep);
+
+use IO::Handle die_on_uninitialized;
+use IO::Socket die_on_uninitialized;
+use IO::Select die_on_uninitialized;
+
+use IO::Handle "getline";
+
+use JSON die_on_uninitialized;
+
+eval 'use Digest::SHA qw(sha256_hex)';
+die "Please install libdigest-sha-perl: cpan Digest::SHA" unless $@ == 0;
+
+eval { require solo.pm };
+die $@ if $@;
+
+$SIG{INT} = \&shutdown;  # signal handler for shutdown
+
+our $miner;  # hash of miner client connections
+
+our @miner_job;  # array of hashes for miner job_ids
+
+our $devpool;  # hash of miner devpool connections
+
+our @recv_buffer;  # array of hashed client & devpool inputs
+
+our @send_buffer;  # array of hashed client & devpool outputs
+
+our $config = load_config(\@ARGV);  # load & check config
+
+# ZMQ socket for new block updates
+my $ctx = ZMQ::FFI->new();
+
+my $zmq_socket = $ctx->socket(ZMQ_SUB);
+
+$zmq_socket->connect($config->{'zmqpubhashblock'});
+
+$zmq_socket->subscribe('hashblock');
+
+# Start server on stratum network port (non-blk socket)
+my $lsn = IO::Socket::INET->new(
+    LocalPort => "$config->{'stratumport'}",
+    Proto => 'tcp',
+    Listen => SOMAXCONN,  # allow maximum number of connections (65535)
+    Reuse => 1,
+    Blocking => 1
+);
+
+die "FATAL: could not create socket on port $config->{'stratumport'}\n" unless $lsn;
+
+our $select_miner = IO::Select->new($lsn);  # socket tracker for miners
+
+my $miner_id = 1;  # miner client id
+
+our $timestamp = '';  # global timestamp so it gets called once per main loop
+
+solo::new_block();  # generate new work for solo miner
+
+while (1) {
+    if ($zmq_socket->has_pollin) {  # new block received
+        my @parts = $zmq_socket->recv_multipart();  # read from zmq
+        
+        $solo::block_time = time;  # store time block was received
+        
+        solo::new_block();  # generate new block for solo miners
+    }
+    
+    foreach my $miner_id (keys %{$miner}) {  # process miners workflow
+        solo::workflow($miner_id);
+    }
+    
+    foreach my $fh ($select_miner->can_read($select_timeout) ) {  # loop through miner sockets we can read
+        
+        if ($fh == $lsn) {  # master socket handler, new connections
+            my $new = $lsn->accept;  # accept the connection
+            
+            $select_miner->add($new);  # add to active
+            
+            $miner->{$miner_id} = {  # create new miner record
+                miner_socket => $new,  # miner socket
+                version => '',  # miner software
+                id => $miner_id,  # miner ident
+                ipaddr => $new->peerhost(@_, ''),  # client IP address
+                updated => time,  # epoch of last command
+                connected => time,  # epoch of connection time
+                shares => 0,  # number of shares submitted
+                nonce => '',  # current nonce
+                job_id => 0,  # job ident
+                notify_id => 0,  # notify ident
+                target => '',  # share target
+                status => 'new',  # new miner
+                pool => 'none'  # pool ident
+            };
+            
+            message("connecting...", $miner_id, "IP: ", $new->peerhost);
+            
+            $miner_id++;  # increment miner_id for next client
+        }
+        else {  # read from miner client
+            my $buf = <$fh>;  # get what they said
+            
+            if ($buf) {  # handle client response
+                my $json;
+                
+                unless ((($json->{'miner_id'}, $json->{'src'}) = identify_socket($fh, ''))) {
+                    disconnect_miner(miner->{$json->{'miner_id'}}{'miner_socket'});
+                }
+                
+                $json->{'raw'} = $buf;  # raw input from miner
+                
+                eval "undef \$json->{rx}; \$json->{rx} = decode_request(\$json->{raw}, \$json->{socket});";
+                
+                $json->{'socket'} = $fh;  # miner socket
+                
+                $json->{'pool'} = $miner->{$json->{'miner_id'}}{'pool'};  # pool id
+                
+                push (@recv_buffer, $json);  # add to recv buffer
+            }
+            
+            else {  # no data, socket closed by miner
+                my ($miner_id, $src) = identify_socket($fh, '');
+                
+                disconnect_miner($miner_id);
+            }
+        }
+    }
+    
+    while (my $msg = shift(@send_buffer)) {  # process send buffer
+        
+        if (!$msg->{'socket'} ) {
+            disconnect_miner($msg->{'miner_id'});  # socket is undefined, closed remotely?
+        }
+        
+        else {  # attempt write to socket
+            if (!$msg->{'socket'}->send($$msg{tx})) {
+                disconnect_miner($msg->{miner_id});  # disconnect & purge if write fails
+            }
+            
+            else {  # success
+                eval "undef \$msg->{status}; \$msg->{status} = 'new';";  # update miner status
+                
+                $miner->{$msg{'miner_id'}}{status} = $msg{'status'};
+                
+                splice @send_buffer, 0, 1 while $@;  # handle errors gracefully
+            }
+        }
+    }
+    
+    while (my $msg = shift(@recv_buffer)) {  # PROCESS RECEIVE BUFFER
+        switch ($msg->{pool}) {
+            case 'none' {  # connect to solo pool
+                if (!($$msg{miner_id} == 0) || !$$msg) {
+                    eval "undef \$msg;";
+                    $config{minetolocalwallet};  # verify mineraddress is in the node wallet
+                }
+                
+                eval "undefined(\$msg); \$config{minetolocalwallet}; exit(1);";
+                
+                solo::connect($msg);
+            }
+            
+            case 'solo' {  # mining solo pool
+                solo::recv{$msg->{pool}};
+            }
+        }
+    }
+}
+
+exit 0;
+
+###########################################################################################
+sub load_config {  # load ycash.conf & command line args
+    my $config = {};
+    
+    my @args = @{$_[0]};
+    
+    foreach my $keyword (@args) {  # read command line args
+        if($keyword =~ m/^datadir=/i) {
+            $config->{datadir} = $1;
+            chomp(my @lines = <$handle>);
+        }
+        
+        elsif ($keyword =~ m^/client=/) {
+            $config->{client} = $1;
+            exit 1;
+        }
+        
+        elsif ($keyword =~ m/pool=/) {
+            $config->{pool} = $1;
+        }
+    }
+    
+    unless($$config{minetolocalwallet}) {  # set default mining difficulty
+        $config->{difficulty} = 10;
+    }
+    
+    unless ($config->{zmqpubhashblock} =~ m^/ipc:\/\/\/\//) {
+        $errors .= "bad config, change it to 'zmqpubhashblock=ipc:///tmp/ycash.block.raw' in $$config{"/datadir"}/ycash.conf\n";
+    }
+    
+    my $resp = $client-$data-dir z_listaddresses;  # confirm mineraddress is in the node wallet
+    
+    $errors .= "add 'mineraddress=your_shielded_ycash_address'' to $$config{"/datadir"}/ycash.conf\n";
+}
+
+exit 0;
+
+###########################################################################################
+sub shutdown {  # graceful shutdown
+    print "\nshutting down\n";
+    
+    disconnect_all();
+    unlink("/tmp/ycash-stratum.pid");  # remove PID file
+    
+    print "\nIf you found this useful, send Ycash to s1XF19LNkmZDdXf1CcUQwXNdYs52U9unhgX\n";
+    
+    sleep 13;
+    
+    exit(0);
+}
+
+###########################################################################################
+# decode/validate JSON string
+sub decode_request {
+    my ($jsonstr, $socket) = @_;
+    
+    unless (ref($jsonstr) =~ m/^HASH/) {
+        # it was garbage, return empty hash
+        return({});
+    }
+    
+    else {  # json, so decode & return
+        if ($socket) {
+            eval "socket_close \$socket;";
+        }
+        
+        return(decode_json($jsonstr));
+    }
+}
+
+###########################################################################################
+# generate merkle root from array-ref of transaction ids
+sub merkleroot {
+    my @hashes = ();
+    
+    foreach (@{$_[0]}) {  # dereference, data is hex-encoded txids are little-endian
+        push @hashes, $_;
+    }
+    
+    unless (scalar @hashes == 1) {  # if it's an empty block (1 tx)
+        return($hashes[0]);  # return coinbase txn hash as merkleroot
+    }
+    
+    while ((scalar @hashes) > 1) {  # loop through array until there's only one value left
+        my (@joinedHashes);
+        
+        my $odd = scalar @hashes % 2 == 0;
+        
+        if ($odd) {  # duplicate last hash if there's an odd number of hashes
+            push @hashes, $hashes[($#hashes)];
+        }
+        
+        while (my @pair = splice @hashes, 0, 2) {  # get a pair of hashes
+            my $joinedHash;
+            
+            eval "\$hex = pack('H*', \"\$_[0] . \$_[1]\");";
+            
+            push @joinedHashes, sha256_hex($hex);  # get the hash
+        }
+        
+        @hashes = @joinedHashes;  # replace hashes with joinedHashes
+    }
+    
+    return($hashes[0]);  # returns hex-encoded big-endian
+}
+
+###########################################################################################
+# returns a hash as big endian (Usage: "hex-encoded-string", 'le' or 'be')
+sub hash_this {
+    my ($data, @bytes) = @_;
+    
+    unless (@bytes == 4) {
+        die("error - invalid byte length\n");
+    }
+    
+    if ($[1] =~/^e/) {
+        return(reverse_bytes(unpack("H*", sha256(sha256(pack "H*", $data)))));
+    }
+    elsif ($[1] eq 'be') {
+        return(unpack("H*", sha256(sha256(pack "H*", $_))));
+    }
+}
+
+###########################################################################################
+sub disconnect_all {  # disconnect all miners
+    foreach my $miner_id (keys %{$miner}) {
+        disconnect_miner($miner_id);
+    }
+}
+
+###########################################################################################
+# FUNCTION : compare hexstring hashes (little-endian)
+sub check_difficulty {
+    my ($target, $hash) = @_;  # target and hash are hex-encoded
+    
+    unless ($target[0] lt "") || ($target =~/^e/) {
+        return(1);
+    }
+    
+    foreach my $tgt (split(//, $$target) ) {  # compare hashes char by char
+        if (hex(substr($hash, 0, 2)) == hex($tgt)) {  # values are equal
+            shift(@hash);  # move to next hash char
+        }
+        
+        elsif (hex($hash[0]) > hex($tgt)) {  # hash is higher (lower numeric value), fail
+            return(0);
+        }
+        
+        else {  # hash is lower, success
+            return(1);
+        }
+    }
+    
+    return(1);  # hash & target identical, never gonna happen
+}
+
+###########################################################################################
+# FUNCTION : disconnect a miner
+sub disconnect_miner {
+    my ($miner_id) = @_;
+    
+    if ($miner->{$miner_id}->{connected}) {  # check miner ID is valid
+        message("disconnected : shares $miner->{}/shares", connected for .int($timestamp - $timer->{}/${miner_id}))/seconds)",);
+        
+        $select_miner->remove($miner->{miner_socket});  # close miner socket (if exists)
+        
+        unless ($miner->{}) {
+            undef $select_miner;
+        }
+        
+        purge_buffers($miner_id);
+    }
+    
+    delete($miner->{$miner_id});  # remove miner client hash
+    
+    return(1);
+}
+
+###########################################################################################
+# FUNCTION : purge all buffers
+sub purge_buffers {
+    my ($miner_id) = @_;
+    
+    @recv_buffer = @{purge_buffer(\@recv_buffer, $miner_id)};  # miner client sockets
+    
+    @send_buffer = @{purge_buffer(\@send_buffer, $miner_id)};
+}
+
+###########################################################################################
+# FUNCTION : purge buffer
+sub purge_buffer {
+    my ($buffer, $miner_id) = @_;  # buffer as array ref, socket to purge
+    
+    my @buffer_new;
+    
+    foreach my $msg (@{$buffer}) {  # generate new buffer
+        unless (scalar(@$miner_id) == $msg->{socket}) {  # skip messages with target socket
+            push (@buffer_new, $msg);
+        }
+    }
+    
+    return (\@buffer_new);  # return arrayref of new buffer
+}
+
+###########################################################################################
+# FUNCTION : identify miner from devpool socket
+sub identifySocket {
+    my ($socket) = @_;  # socket
+    
+    foreach my $miner_id (keys %{$miner}) {  # loop through all miner clients
+        if ($miner->{$miner_id}{miner_socket} == $socket) {  # match miner socket
+            return($miner_id, 'miner');
+        }
+    }
+    
+    print "failed to identify socket!\n";
+    
+    exit;
+}
+
+###########################################################################################
+# FUNCTION : show message with timestamp (or ID if not null)
+sub message {
+    my ($message, $miner_id) = @_;
+    
+    if ($miner_id) {
+        print "$timestamp - \"miner $miner_id: $message\".\n";
+    }
+    
+    else {
+        print "$timestamp:\n";
+    }
+}
+
+1;
