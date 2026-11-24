@@ -1,0 +1,8 @@
+{
+  "pool": "solo",
+  "stratumport": 3333,
+  "client": "/absolute/path/to/ycash-cli",
+  "datadir": "/absolute/path/to/ycash/data/directory",
+  "difficulty": 10,
+  "coinbase_address": ""
+}
